@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Starfall</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    html, body {
+      width:100%; height:100%;
+      background:#020617;
+      display:flex; justify-content:center; align-items:center;
+      overflow:hidden;
+    }
+    canvas { display:block; cursor:none; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ── Canvas ────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const W = 480, H = 720;
+let scale = 1;
+
+function resize() {
+  scale = Math.min(innerWidth / W, innerHeight / H, 2);
+  canvas.width  = Math.floor(W * scale);
+  canvas.height = Math.floor(H * scale);
+}
+addEventListener('resize', resize);
+resize();
+
+// ── Audio ─────────────────────────────────────────────────────
+let AC = null;
+
+function note(hz, dur, wave = 'sine', vol = 0.18, delay = 0) {
+  if (!AC) return;
+  try {
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.connect(g); g.connect(AC.destination);
+    o.type = wave; o.frequency.value = hz;
+    const t = AC.currentTime + delay;
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(vol, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.start(t); o.stop(t + dur + 0.05);
+  } catch (_) {}
+}
+
+// Scale pitch up as combo grows — makes catches feel more exciting at high streaks
+function pf(hz) { return hz * (1 + Math.min(combo, 22) * .012); }
+
+const SFX = {
+  star:    () => { note(pf(523),.2); note(pf(659),.2,'sine',.12,.08); },
+  moon:    () => { [392,494,587].forEach((f,i) => note(pf(f),.3,'sine',.12,i*.09)); },
+  comet:   () => { [523,659,784,988,1175].forEach((f,i) => note(pf(f),.2,'sine',.12,i*.06)); },
+  bomb:    () => { note(120,.5,'sawtooth',.22); note(80,.6,'square',.14,.1); },
+  alien:   () => { note(320,.12,'sine',.14); note(260,.12,'sine',.12,.1); note(300,.15,'sine',.1,.2); },
+  golden:  () => { [659,784,988,1175,1397].forEach((f,i) => note(f,.2,'sine',.15,i*.05)); note(1568,.5,'sine',.1,.28); },
+  tier:    () => { [523,659,784,988].forEach((f,i) => note(f,.25,'sine',.16,i*.04)); },
+  power:   () => { [523,659,784].forEach((f,i) => note(f,.22,'triangle',.15,i*.08)); },
+  shield:  () => { note(440,.3,'sine',.12); note(660,.35,'sine',.1,.06); },
+  nearMiss:() => { note(800,.08,'sawtooth',.1); },
+  over:    () => { [392,349,330,294,262,220].forEach((f,i) => note(f,.45,'sine',.18,i*.21)); },
+  lvl:     () => { [784,988,1175].forEach((f,i) => note(f,.2,'sine',.14,i*.07)); },
+};
+
+// ── State ─────────────────────────────────────────────────────
+let S = 'menu'; // 'menu' | 'play' | 'choose' | 'over'
+let score, hi = +localStorage.starfall_hi || 0;
+let lives, combo, maxCombo, caught, level;
+let frame = 0, spawnTimer = 0, goldenDelay = 0;
+
+// Juice
+let freezeFrames = 0, shake = 0, flashAlpha = 0, flashColor = '#fff';
+
+// Power-ups
+let active = [];     // {id, framesLeft, charges?}
+let pwrCards = [];   // 2 PWR entries shown on choose screen
+
+// ── Player ────────────────────────────────────────────────────
+const P_BASE_R = 40;
+const P = { x: W/2, y: H-95, r: P_BASE_R, speed: 6, flash: 0 };
+
+// ── Collections ───────────────────────────────────────────────
+let fallers, particles, popups;
+
+// ── Background ────────────────────────────────────────────────
+const bgStars = Array.from({length: 140}, () => ({
+  x: Math.random()*W, y: Math.random()*H,
+  r: Math.random()*1.5 + .2,
+  b: Math.random(),
+  ts: Math.random()*.025 + .004,
+  to: Math.random()*Math.PI*2,
+}));
+
+const nebulae = [
+  { x:W*.18, y:H*.28, r:130, c:'rgba(88,28,135,0.07)'  },
+  { x:W*.82, y:H*.55, r:160, c:'rgba(30,64,175,0.08)'  },
+  { x:W*.5,  y:H*.12, r:110, c:'rgba(134,25,143,0.06)' },
+  { x:W*.35, y:H*.75, r:100, c:'rgba(15,52,96,0.07)'   },
+];
+
+// ── Object configs ────────────────────────────────────────────
+const OBJ = {
+  star:   { pts: 1, r:14, spd:[1.6,3.0], col:'#fbbf24', glow:'#fde68a' },
+  moon:   { pts: 3, r:16, spd:[1.2,2.5], col:'#e2e8f0', glow:'#94a3b8' },
+  comet:  { pts: 5, r:11, spd:[3.5,5.5], col:'#60a5fa', glow:'#93c5fd' },
+  bomb:   { pts: 0, r:13, spd:[1.5,2.8], col:'#1f2937', glow:'#ef4444' },
+  alien:  { pts:-3, r:14, spd:[1.8,3.2], col:'#4ade80', glow:'#86efac' },
+  golden: { pts: 0, r:16, spd:[4.2,5.8], col:'#fde047', glow:'#fef08a' },
+};
+
+// ── Power-up pool ─────────────────────────────────────────────
+// dur: frames (-1 = permanent or charge-based)
+const PWR = [
+  { id:'magnet',   name:'Magnet',      icon:'🧲', desc:'Pulls nearby items in',    dur: 540 },
+  { id:'shield',   name:'Shield',      icon:'🛡',  desc:'Absorbs your next bomb',   dur: -1  },
+  { id:'rain',     name:'Comet Rain',  icon:'☄️', desc:'Only comets fall',          dur: 600 },
+  { id:'slow',     name:'Slow Time',   icon:'⏳', desc:'Everything slows to half',  dur: 480 },
+  { id:'wide',     name:'Wide Net',    icon:'🌙', desc:'+30% catch radius (keeps)', dur: -1  },
+  { id:'pacifist', name:'Cosmic Peace',icon:'✨', desc:'No bombs or aliens',         dur: 720 },
+];
+
+// ── Spawn logic ───────────────────────────────────────────────
+function pickType(lvl) {
+  if (active.some(a=>a.id==='rain')) return 'comet';
+  const bp = Math.min(.07 + lvl*.012, .18);
+  const cp = Math.min(.06 + lvl*.012, .16);
+  const ap = .06;
+  const mp = .22, sp = 1 - bp - cp - ap - mp;
+  const pacifist = active.some(a=>a.id==='pacifist');
+  let t;
+  do {
+    const r = Math.random();
+    if      (r < sp)          t = 'star';
+    else if (r < sp+mp)       t = 'moon';
+    else if (r < sp+mp+cp)    t = 'comet';
+    else if (r < sp+mp+cp+ap) t = 'alien';
+    else                      t = 'bomb';
+  } while (pacifist && (t==='bomb' || t==='alien'));
+  return t;
+}
+
+function spawnOne() {
+  const t = pickType(level);
+  const c = OBJ[t];
+  const spd = (c.spd[0] + Math.random()*(c.spd[1]-c.spd[0])) * (1+(level-1)*.07);
+  fallers.push({
+    t, x: c.r + Math.random()*(W-c.r*2), y: -c.r-5,
+    vy: spd,
+    vx: t==='comet' ? (Math.random()-.5)*2 : 0,
+    r: c.r, rot: 0, rs: (Math.random()-.5)*.06,
+    nearMissed: false,
+  });
+}
+
+function spawnMs(lvl) { return Math.max(480, 1350 - lvl*55); }
+
+// ── Helpers ───────────────────────────────────────────────────
+function comboMult() {
+  if (combo < 5)  return 1;
+  if (combo < 10) return 2;
+  if (combo < 20) return 3;
+  if (combo < 35) return 5;
+  return 10;
+}
+
+function burst(x, y, col, n=14) {
+  for (let i=0; i<n; i++) {
+    const a = (Math.PI*2*i/n) + Math.random()*.4;
+    const v = 1.8 + Math.random()*3;
+    particles.push({ x, y,
+      vx: Math.cos(a)*v, vy: Math.sin(a)*v,
+      life: 1, dec: .03+Math.random()*.025, r: 2+Math.random()*3, col });
+  }
+}
+
+function popup(x, y, txt, col='#fbbf24') {
+  popups.push({ x, y, txt, col, life: 1 });
+}
+
+function rRect(x, y, w, h, r) {
+  ctx.beginPath();
+  if (ctx.roundRect) { ctx.roundRect(x, y, w, h, r); }
+  else               { ctx.rect(x, y, w, h); }
+}
+
+// ── Draw: objects ─────────────────────────────────────────────
+function star5(x, y, r, rot, col, glow) {
+  ctx.save(); ctx.translate(x,y); ctx.rotate(rot);
+  const g = ctx.createRadialGradient(0,0,0,0,0,r*2.2);
+  g.addColorStop(0, glow+'aa'); g.addColorStop(1, glow+'00');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0,0,r*2.2,0,Math.PI*2); ctx.fill();
+  ctx.beginPath();
+  for (let i=0; i<5; i++) {
+    const oa = i*2*Math.PI/5 - Math.PI/2;
+    const ia = oa + Math.PI/5;
+    i===0 ? ctx.moveTo(Math.cos(oa)*r,   Math.sin(oa)*r)
+           : ctx.lineTo(Math.cos(oa)*r,   Math.sin(oa)*r);
+    ctx.lineTo(Math.cos(ia)*r*.4, Math.sin(ia)*r*.4);
+  }
+  ctx.closePath(); ctx.fillStyle = col; ctx.fill();
+  ctx.restore();
+}
+
+function drawMoon(x, y, r, rot) {
+  ctx.save(); ctx.translate(x,y); ctx.rotate(rot);
+  const g = ctx.createRadialGradient(0,0,0,0,0,r*2.3);
+  g.addColorStop(0,'rgba(226,232,240,.3)'); g.addColorStop(1,'rgba(226,232,240,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0,0,r*2.3,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#e2e8f0';
+  ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#0b0b1e';
+  ctx.beginPath(); ctx.arc(r*.38,-r*.08,r*.82,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawComet(x, y, r, rot) {
+  ctx.save(); ctx.translate(x,y); ctx.rotate(rot+Math.PI*.5);
+  const tg = ctx.createLinearGradient(0,0,0,-r*4.2);
+  tg.addColorStop(0,'rgba(96,165,250,.9)');
+  tg.addColorStop(.6,'rgba(96,165,250,.25)');
+  tg.addColorStop(1,'rgba(96,165,250,0)');
+  ctx.fillStyle = tg;
+  ctx.beginPath(); ctx.moveTo(-r*.35,0); ctx.lineTo(r*.35,0); ctx.lineTo(0,-r*4.2); ctx.closePath(); ctx.fill();
+  const hg = ctx.createRadialGradient(0,0,0,0,0,r);
+  hg.addColorStop(0,'#ffffff'); hg.addColorStop(.45,'#93c5fd'); hg.addColorStop(1,'#3b82f6');
+  ctx.fillStyle = hg;
+  ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawBomb(x, y, r, rot) {
+  ctx.save(); ctx.translate(x,y); ctx.rotate(rot);
+  const g = ctx.createRadialGradient(0,0,0,0,0,r*2.3);
+  g.addColorStop(0,'rgba(239,68,68,.25)'); g.addColorStop(1,'rgba(239,68,68,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0,0,r*2.3,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#1f2937'; ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#4b5563'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.stroke();
+  ctx.strokeStyle = '#d97706'; ctx.lineWidth = 2.2; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(r*.38,-r*.75); ctx.bezierCurveTo(r*1.05,-r*1.2,r*.55,-r*1.65,r*.62,-r*1.95); ctx.stroke();
+  if (frame%14<8) {
+    ctx.fillStyle='#fef08a'; ctx.shadowColor='#fbbf24'; ctx.shadowBlur=6;
+    ctx.beginPath(); ctx.arc(r*.62,-r*1.95,2.8,0,Math.PI*2); ctx.fill(); ctx.shadowBlur=0;
+  }
+  ctx.fillStyle = '#ef4444';
+  ctx.beginPath(); ctx.arc(-r*.28,-r*.12,2.6,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc( r*.28,-r*.12,2.6,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawAlien(x, y, r, rot) {
+  ctx.save(); ctx.translate(x,y); ctx.rotate(rot);
+  const g = ctx.createRadialGradient(0,0,0,0,0,r*2.3);
+  g.addColorStop(0,'rgba(74,222,128,.28)'); g.addColorStop(1,'rgba(74,222,128,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0,0,r*2.3,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#4ade80'; ctx.lineWidth=2; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(-r*.32,-r*.82); ctx.lineTo(-r*.52,-r*1.45); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo( r*.32,-r*.82); ctx.lineTo( r*.52,-r*1.45); ctx.stroke();
+  ctx.fillStyle='#86efac';
+  ctx.beginPath(); ctx.arc(-r*.52,-r*1.45,3.2,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc( r*.52,-r*1.45,3.2,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#4ade80'; ctx.beginPath(); ctx.ellipse(0,0,r,r*1.08,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#052e16';
+  ctx.beginPath(); ctx.ellipse(-r*.32,-r*.05,r*.21,r*.29,-.18,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse( r*.32,-r*.05,r*.21,r*.29, .18,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#fff';
+  ctx.beginPath(); ctx.arc(-r*.26,-r*.13,r*.07,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc( r*.38,-r*.13,r*.07,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#16a34a'; ctx.lineWidth=1.8;
+  ctx.beginPath(); ctx.arc(0,r*.38,r*.28,0,Math.PI); ctx.stroke();
+  ctx.restore();
+}
+
+function drawGolden(x, y, r, rot) {
+  ctx.save(); ctx.translate(x,y); ctx.rotate(rot);
+  // Bright gold glow
+  const g = ctx.createRadialGradient(0,0,0,0,0,r*2.8);
+  g.addColorStop(0,'rgba(253,224,71,.5)'); g.addColorStop(1,'rgba(253,224,71,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0,0,r*2.8,0,Math.PI*2); ctx.fill();
+  // Orbiting mini-stars
+  for (let i=0; i<3; i++) {
+    const a = rot*2.5 + i*(Math.PI*2/3);
+    star5(Math.cos(a)*r*1.75, Math.sin(a)*r*1.75, r*.35, a, '#fde047', '#fef08a');
+  }
+  // Antennae — gold with star tips
+  ctx.strokeStyle='#fbbf24'; ctx.lineWidth=2; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(-r*.32,-r*.82); ctx.lineTo(-r*.52,-r*1.45); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo( r*.32,-r*.82); ctx.lineTo( r*.52,-r*1.45); ctx.stroke();
+  star5(-r*.52,-r*1.45, r*.25, rot, '#fde047','#fef08a');
+  star5( r*.52,-r*1.45, r*.25, rot, '#fde047','#fef08a');
+  // Gold head
+  ctx.fillStyle='#fde047'; ctx.beginPath(); ctx.ellipse(0,0,r,r*1.08,0,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#fbbf24'; ctx.lineWidth=1.5; ctx.beginPath(); ctx.ellipse(0,0,r,r*1.08,0,0,Math.PI*2); ctx.stroke();
+  // Dark eyes
+  ctx.fillStyle='#78350f';
+  ctx.beginPath(); ctx.ellipse(-r*.32,-r*.05,r*.21,r*.29,-.18,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse( r*.32,-r*.05,r*.21,r*.29, .18,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#fff';
+  ctx.beginPath(); ctx.arc(-r*.26,-r*.13,r*.07,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc( r*.38,-r*.13,r*.07,0,Math.PI*2); ctx.fill();
+  // Happy mouth
+  ctx.strokeStyle='#92400e'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(0,r*.32,r*.3,0,Math.PI); ctx.stroke();
+  ctx.restore();
+}
+
+function drawPlayer() {
+  ctx.save(); ctx.translate(P.x, P.y);
+  const fl = P.flash;
+  const col  = fl > .4 ? `rgba(255,255,255,${.7+fl*.3})` : '#c084fc';
+  const gCol = fl > .4 ? '#ffffff' : '#a855f7';
+  ctx.shadowColor = gCol; ctx.shadowBlur = 10 + fl*22;
+  ctx.strokeStyle = col; ctx.lineWidth = 4 + fl*2.5; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(0,0,P.r*.88,.05*Math.PI,.95*Math.PI); ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = fl > .1 ? 'rgba(255,255,255,.35)' : 'rgba(192,132,252,.3)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(-P.r*.88,0); ctx.lineTo(P.r*.88,0); ctx.stroke();
+  const tipCol = fl > .1 ? '#ffffff' : '#e879f9';
+  const tipR   = 3.5 + fl*2;
+  ctx.fillStyle = tipCol; ctx.shadowColor = tipCol; ctx.shadowBlur = 10;
+  ctx.beginPath(); ctx.arc(-P.r*.88,0,tipR,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc( P.r*.88,0,tipR,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+// ── Draw: background ──────────────────────────────────────────
+function drawBg() {
+  const grad = ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0,'#020617'); grad.addColorStop(.4,'#0f0a1e'); grad.addColorStop(1,'#0a0e2a');
+  ctx.fillStyle = grad; ctx.fillRect(0,0,W,H);
+  for (const n of nebulae) {
+    const g = ctx.createRadialGradient(n.x,n.y,0,n.x,n.y,n.r);
+    g.addColorStop(0,n.c); g.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(n.x,n.y,n.r,0,Math.PI*2); ctx.fill();
+  }
+  for (const s of bgStars) {
+    const tw = .25 + .75*Math.abs(Math.sin(frame*s.ts + s.to));
+    ctx.globalAlpha = tw * s.b; ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ── Draw: HUD ─────────────────────────────────────────────────
+function drawActiveIcons() {
+  if (!active.length) return;
+  const iconR = 14;
+  const spacing = 34;
+  const totalW = active.length * spacing - (spacing - iconR*2);
+  let ix = W/2 - totalW/2 + iconR;
+  const iy = H - 48;
+  for (const a of active) {
+    const pwr = PWR.find(p=>p.id===a.id);
+    if (!pwr) { ix += spacing; continue; }
+    // Ring bg
+    ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(ix, iy, iconR, 0, Math.PI*2); ctx.stroke();
+    // Timer ring
+    if (pwr.dur > 0 && a.framesLeft > 0) {
+      const pct = Math.max(0, a.framesLeft / pwr.dur);
+      ctx.strokeStyle = pct > .3 ? '#a855f7' : '#f43f5e'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(ix, iy, iconR, -Math.PI/2, -Math.PI/2 + pct*Math.PI*2); ctx.stroke();
+    } else {
+      // Permanent / charge — solid ring
+      ctx.strokeStyle = a.id==='shield' ? '#60a5fa' : '#c084fc'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(ix, iy, iconR, 0, Math.PI*2); ctx.stroke();
+    }
+    ctx.font = '16px serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(pwr.icon, ix, iy);
+    ix += spacing;
+  }
+}
+
+function drawHUD() {
+  ctx.save(); ctx.textBaseline = 'top';
+  // Score
+  ctx.font = 'bold 26px Georgia,serif'; ctx.fillStyle = '#f1f5f9'; ctx.textAlign = 'left';
+  ctx.shadowColor = '#c084fc'; ctx.shadowBlur = 8;
+  ctx.fillText(score, 18, 16); ctx.shadowBlur = 0;
+  ctx.font = '12px Georgia,serif'; ctx.fillStyle = '#475569';
+  ctx.fillText('Best: ' + hi, 18, 46);
+  // Lives
+  ctx.textAlign = 'center';
+  for (let i=0; i<3; i++) {
+    ctx.globalAlpha = i < lives ? 1 : .16;
+    ctx.font = '22px serif'; ctx.fillStyle = '#f43f5e';
+    ctx.shadowColor = '#f43f5e'; ctx.shadowBlur = i < lives ? 8 : 0;
+    ctx.fillText('♥', W/2 - 22 + i*22, 14);
+  }
+  ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+  // Combo
+  ctx.textAlign = 'right';
+  if (combo >= 5) {
+    const m = comboMult();
+    ctx.font = 'bold 16px Georgia,serif'; ctx.fillStyle = '#fbbf24';
+    ctx.shadowColor = '#fbbf24'; ctx.shadowBlur = 8;
+    ctx.fillText(`×${m} COMBO`, W-16, 16); ctx.shadowBlur = 0;
+    ctx.font = '12px Georgia,serif'; ctx.fillStyle = '#fde68a';
+    ctx.fillText(`${combo} streak`, W-16, 36);
+  } else if (combo > 0) {
+    ctx.font = '13px Georgia,serif'; ctx.fillStyle = '#64748b';
+    ctx.fillText(`${combo} streak`, W-16, 16);
+  }
+  // Level
+  ctx.textAlign = 'center'; ctx.font = '11px Georgia,serif'; ctx.fillStyle = '#1e293b';
+  ctx.fillText(`LEVEL ${level}`, W/2, H-18);
+  // Active power-up icons
+  drawActiveIcons();
+  ctx.restore();
+}
+
+// ── Draw: screens ─────────────────────────────────────────────
+function drawMenu() {
+  drawBg(); ctx.save();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 60px Georgia,serif'; ctx.fillStyle = '#f0abfc';
+  ctx.shadowColor = '#a855f7'; ctx.shadowBlur = 40;
+  ctx.fillText('Starfall', W/2, H*.27); ctx.shadowBlur = 0;
+  ctx.font = '15px Georgia,serif'; ctx.fillStyle = '#64748b';
+  ctx.fillText('catch stars · dodge bombs · build combos', W/2, H*.27+55);
+  const t0 = frame*.03;
+  star5(W*.2,  H*.48+Math.sin(t0)*20, 22, t0, '#fbbf24','#fde68a');
+  drawMoon(W*.4,  H*.49+Math.sin(t0+1.6)*20, 20, Math.sin(t0*.8)*.4);
+  drawComet(W*.62, H*.48+Math.sin(t0+3)*20, 15, t0*.5);
+  drawBomb(W*.82, H*.49+Math.sin(t0+4.5)*20, 15, t0*.3);
+  ctx.font = '13px Georgia,serif'; ctx.fillStyle = '#334155';
+  ctx.fillText('⭐ 1pt   🌙 3pts   ☄️ 5pts   👾 −3pts   💣 −1 life', W/2, H*.63);
+  ctx.font = '11px Georgia,serif'; ctx.fillStyle = '#1e293b';
+  ctx.fillText('Every 3 levels: choose a power-up', W/2, H*.68);
+  ctx.font = '12px Georgia,serif'; ctx.fillStyle = '#1e293b';
+  ctx.fillText('Arrow keys / WASD  or  move your mouse', W/2, H*.73);
+  const pulse = .6 + .4*Math.sin(frame*.055);
+  ctx.globalAlpha = pulse;
+  ctx.font = 'bold 21px Georgia,serif'; ctx.fillStyle = '#c084fc';
+  ctx.shadowColor = '#c084fc'; ctx.shadowBlur = 14;
+  ctx.fillText('Click or press Space to start', W/2, H*.84);
+  ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+  if (hi > 0) {
+    ctx.font = '13px Georgia,serif'; ctx.fillStyle = '#334155';
+    ctx.fillText(`High score: ${hi}`, W/2, H*.91);
+  }
+  ctx.restore();
+}
+
+function drawGameOver() {
+  drawBg();
+  ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(0,0,W,H);
+  ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 50px Georgia,serif'; ctx.fillStyle = '#fca5a5';
+  ctx.shadowColor = '#ef4444'; ctx.shadowBlur = 28;
+  ctx.fillText('Game Over', W/2, H*.27); ctx.shadowBlur = 0;
+  ctx.font = 'bold 36px Georgia,serif'; ctx.fillStyle = '#f8fafc';
+  ctx.fillText(score, W/2, H*.41);
+  ctx.font = '16px Georgia,serif'; ctx.fillStyle = '#64748b';
+  ctx.fillText('score', W/2, H*.41+34);
+  if (score > 0 && score >= hi) {
+    ctx.font = 'bold 20px Georgia,serif'; ctx.fillStyle = '#fbbf24';
+    ctx.shadowColor = '#fbbf24'; ctx.shadowBlur = 14;
+    ctx.fillText('✨ New High Score! ✨', W/2, H*.54); ctx.shadowBlur = 0;
+  } else if (hi > 0) {
+    ctx.font = '15px Georgia,serif'; ctx.fillStyle = '#475569';
+    ctx.fillText('Best: ' + hi, W/2, H*.54);
+  }
+  ctx.font = '14px Georgia,serif'; ctx.fillStyle = '#64748b';
+  ctx.fillText(`Max combo: ${maxCombo}×   ·   Stars caught: ${caught}`, W/2, H*.635);
+  const pulse = .6 + .4*Math.sin(frame*.055);
+  ctx.globalAlpha = pulse;
+  ctx.font = 'bold 20px Georgia,serif'; ctx.fillStyle = '#c084fc';
+  ctx.shadowColor = '#c084fc'; ctx.shadowBlur = 12;
+  ctx.fillText('Click or press Space to play again', W/2, H*.82);
+  ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+function drawChooseScreen() {
+  // Dark overlay on top of paused game
+  ctx.fillStyle = 'rgba(2,6,23,.78)'; ctx.fillRect(0,0,W,H);
+  ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 30px Georgia,serif'; ctx.fillStyle = '#f0abfc';
+  ctx.shadowColor = '#a855f7'; ctx.shadowBlur = 22;
+  ctx.fillText('POWER-UP!', W/2, H*.18); ctx.shadowBlur = 0;
+  ctx.font = '14px Georgia,serif'; ctx.fillStyle = '#64748b';
+  ctx.fillText('choose one — press 1 or 2, or click', W/2, H*.25);
+  const cw = 155, ch = 205;
+  const cy = H*.52;
+  pwrCards.forEach((p, i) => {
+    const cx = W*.27 + i * W*.46;
+    // Card bg
+    ctx.fillStyle = 'rgba(15,10,40,.95)';
+    rRect(cx-cw/2, cy-ch/2, cw, ch, 18);
+    ctx.fill();
+    ctx.strokeStyle = i === 0 ? '#7c3aed' : '#1d4ed8'; ctx.lineWidth = 2;
+    rRect(cx-cw/2, cy-ch/2, cw, ch, 18);
+    ctx.stroke();
+    // Icon
+    ctx.font = '52px serif'; ctx.fillStyle = '#fff';
+    ctx.fillText(p.icon, cx, cy - ch*.28);
+    // Name
+    ctx.font = 'bold 16px Georgia,serif'; ctx.fillStyle = '#f0abfc';
+    ctx.shadowColor = '#a855f7'; ctx.shadowBlur = 8;
+    ctx.fillText(p.name, cx, cy + ch*.05); ctx.shadowBlur = 0;
+    // Desc (simple single line)
+    ctx.font = '12px Georgia,serif'; ctx.fillStyle = '#94a3b8';
+    ctx.fillText(p.desc, cx, cy + ch*.22);
+    // Key hint
+    ctx.font = 'bold 15px Georgia,serif'; ctx.fillStyle = '#7c3aed';
+    ctx.fillText(`Press ${i+1}`, cx, cy + ch*.37);
+  });
+  ctx.restore();
+}
+
+// ── Update ────────────────────────────────────────────────────
+const keys = {};
+let mouseX = null;
+
+function update(dt) {
+  if (S !== 'play') return;
+
+  // Spawn
+  spawnTimer += dt * 16.67;
+  const si = spawnMs(level);
+  while (spawnTimer >= si) {
+    spawnTimer -= si;
+    spawnOne();
+    if (level > 4 && Math.random() < .2) spawnOne();
+  }
+
+  // Golden alien delayed spawn
+  if (goldenDelay > 0) {
+    goldenDelay -= dt;
+    if (goldenDelay <= 0) {
+      goldenDelay = 0;
+      const c = OBJ.golden;
+      const spd = c.spd[0] + Math.random()*(c.spd[1]-c.spd[0]);
+      fallers.push({ t:'golden', x: c.r+Math.random()*(W-c.r*2), y:-c.r-5,
+        vy: spd, vx: 0, r: c.r, rot:0, rs:.04, nearMissed:false });
+    }
+  }
+
+  // Player movement
+  let mv = 0;
+  if (keys['ArrowLeft'] || keys['a'] || keys['A']) mv -= 1;
+  if (keys['ArrowRight']|| keys['d'] || keys['D']) mv += 1;
+  const spd = P.speed * (1 + (level-1)*.025);
+  if (mv) {
+    P.x = Math.max(P.r+5, Math.min(W-P.r-5, P.x + mv*spd));
+    mouseX = null;
+  } else if (mouseX !== null) {
+    const dx = mouseX - P.x;
+    if (Math.abs(dx) > 2) P.x += dx * .15;
+    P.x = Math.max(P.r+5, Math.min(W-P.r-5, P.x));
+  }
+  if (P.flash > 0) P.flash = Math.max(0, P.flash - .055);
+
+  // Active power-up timers
+  const slowActive    = active.some(a=>a.id==='slow');
+  const magnetActive  = active.some(a=>a.id==='magnet');
+  for (let i = active.length-1; i >= 0; i--) {
+    const a = active[i];
+    if (a.framesLeft > 0) { a.framesLeft -= dt; if (a.framesLeft <= 0) active.splice(i, 1); }
+  }
+
+  // Fallers
+  for (let i = fallers.length-1; i >= 0; i--) {
+    const f = fallers[i];
+    const speedMult = slowActive ? .5 : 1;
+    f.x += f.vx * dt;
+    f.y += f.vy * dt * speedMult;
+    f.rot += f.rs * dt;
+    if (f.x < f.r)   { f.x = f.r;   f.vx *= -1; }
+    if (f.x > W-f.r) { f.x = W-f.r; f.vx *= -1; }
+
+    // Magnet pull on collectibles
+    if (magnetActive && f.t !== 'bomb' && f.t !== 'alien' && f.y > H*.35) {
+      const dx = P.x - f.x;
+      const dist = Math.abs(dx);
+      if (dist < 130 && dist > 5) {
+        f.vx += (dx/dist) * .9 * dt;
+        f.vx = Math.max(-5, Math.min(5, f.vx));
+      }
+    }
+
+    // Near-miss detection for bombs
+    if (f.t === 'bomb' && !f.nearMissed) {
+      const justPassed = f.y > P.y + 22 && (f.y - f.vy*dt*speedMult) <= P.y + 22;
+      if (justPassed) {
+        const dh = Math.abs(f.x - P.x);
+        const catchW = P.r*.92 + f.r*.55;
+        if (dh < P.r * 1.7 && dh > catchW) {
+          f.nearMissed = true;
+          score += 1;
+          flashColor = '#dc2626'; flashAlpha = .22;
+          shake = Math.max(shake, 3);
+          popup(f.x, P.y-32, 'CLOSE! +1', '#fca5a5');
+          SFX.nearMiss();
+        }
+      }
+    }
+
+    // Catch zone
+    const inH = Math.abs(f.x - P.x) < P.r*.92 + f.r*.55;
+    const inV = f.y > P.y - 20 && f.y < P.y + 22;
+
+    if (inH && inV) {
+      fallers.splice(i, 1);
+
+      if (f.t === 'bomb') {
+        const shieldIdx = active.findIndex(a=>a.id==='shield');
+        if (shieldIdx !== -1) {
+          active.splice(shieldIdx, 1);
+          burst(f.x, f.y, '#60a5fa', 20);
+          popup(f.x, f.y-32, '🛡 BLOCKED!', '#60a5fa');
+          shake = Math.max(shake, 4);
+          SFX.shield();
+        } else {
+          lives--; combo = 0; P.flash = .25;
+          burst(f.x, f.y, '#ef4444', 24);
+          popup(f.x, f.y-32, '💥  −1 life', '#ef4444');
+          freezeFrames = 6; shake = 14;
+          flashColor = '#dc2626'; flashAlpha = .38;
+          SFX.bomb();
+          if (lives <= 0) { endGame(); return; }
+        }
+      } else if (f.t === 'alien') {
+        score = Math.max(0, score - 3); combo = 0; P.flash = .25;
+        burst(f.x, f.y, '#4ade80', 18);
+        popup(f.x, f.y-32, '👾  −3 pts', '#4ade80');
+        SFX.alien();
+      } else if (f.t === 'golden') {
+        const m   = comboMult();
+        const pts = 25 * m;
+        score += pts;
+        const prevCombo = combo;
+        combo = Math.min(combo * 2, 99);
+        if (combo > maxCombo) maxCombo = combo;
+        P.flash = 1;
+        freezeFrames = 5; shake = 8;
+        flashColor = '#fde047'; flashAlpha = .28;
+        burst(f.x, f.y, '#fde047', 30);
+        popup(f.x, f.y-30, `JACKPOT! +${pts}`, '#fde047');
+        SFX.golden();
+      } else {
+        // star / moon / comet
+        const oldMult = comboMult();
+        combo++; caught++;
+        if (combo > maxCombo) maxCombo = combo;
+        const newMult = comboMult();
+        const pts = OBJ[f.t].pts * newMult;
+        score += pts; P.flash = 1;
+        burst(f.x, f.y, OBJ[f.t].glow, 16);
+        popup(f.x, f.y-30, newMult>1 ? `+${pts}  ×${newMult}` : `+${pts}`, OBJ[f.t].col);
+        // Tier-up flash
+        if (newMult > oldMult) {
+          freezeFrames = 4; shake = 5;
+          flashColor = '#a855f7'; flashAlpha = .18;
+          popup(W/2, H/2-40, `×${newMult} COMBO!`, '#f0abfc');
+          SFX.tier();
+        } else {
+          SFX[f.t]();
+        }
+        if (f.t === 'comet') { freezeFrames = Math.max(freezeFrames, 3); shake = Math.max(shake, 4); }
+        // Level progression
+        const newLvl = 1 + Math.floor(caught/18);
+        if (newLvl > level) {
+          level = newLvl;
+          if (level % 3 === 0) {
+            // Offer power-up choice — shuffle and pick 2
+            const shuffled = PWR.slice().sort(() => Math.random()-.5);
+            pwrCards = shuffled.slice(0, 2);
+            S = 'choose';
+          } else {
+            popup(W/2, H*.45, `LEVEL ${level}`, '#c084fc');
+            SFX.lvl();
+          }
+        } else { level = newLvl; }
+        // Schedule golden alien after combo milestones
+        if ((combo === 10 || combo === 20 || combo === 35) && goldenDelay <= 0) {
+          goldenDelay = 90; // ~1.5s
+        }
+      }
+    } else if (f.y > H + f.r) {
+      fallers.splice(i, 1);
+      if (f.t === 'golden') {
+        combo = Math.floor(combo / 2);
+        popup(W/2, H*.55, 'MISSED IT!', '#fde047');
+      } else if (f.t !== 'bomb' && f.t !== 'alien') {
+        combo = 0;
+      }
+    }
+  }
+
+  // Particles
+  for (let i = particles.length-1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx*dt; p.y += p.vy*dt; p.vy += .1*dt; p.life -= p.dec*dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  // Popups
+  for (let i = popups.length-1; i >= 0; i--) {
+    const p = popups[i];
+    p.y -= 1.1*dt; p.life -= .022*dt;
+    if (p.life <= 0) popups.splice(i, 1);
+  }
+}
+
+function selectPowerUp(idx) {
+  const pwr = pwrCards[idx];
+  if (!pwr) return;
+  if (pwr.id === 'wide') {
+    P.r *= 1.3;
+    active.push({ id:'wide', framesLeft: -1 });
+  } else if (pwr.id === 'shield') {
+    active.push({ id:'shield', framesLeft: -1, charges: 1 });
+  } else {
+    active.push({ id: pwr.id, framesLeft: pwr.dur });
+  }
+  SFX.power();
+  popup(W/2, H*.48, `${pwr.icon} ${pwr.name}!`, '#c084fc');
+  pwrCards = []; S = 'play';
+}
+
+// ── Game flow ─────────────────────────────────────────────────
+function endGame() {
+  S = 'over';
+  if (score > hi) { hi = score; localStorage.starfall_hi = hi; }
+  SFX.over();
+}
+
+function startGame() {
+  S = 'play';
+  score = 0; lives = 3; combo = 0; maxCombo = 0; caught = 0; level = 1;
+  fallers = []; particles = []; popups = []; active = []; pwrCards = [];
+  P.x = W/2; P.r = P_BASE_R; P.flash = 0;
+  spawnTimer = 0; goldenDelay = 0;
+  freezeFrames = 0; shake = 0; flashAlpha = 0;
+  if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+  for (let i=0; i<3; i++) spawnOne();
+}
+
+// ── Render ────────────────────────────────────────────────────
+function drawFallers() {
+  for (const f of fallers) {
+    if      (f.t === 'star')   star5(f.x,f.y,f.r,f.rot,OBJ.star.col,OBJ.star.glow);
+    else if (f.t === 'moon')   drawMoon(f.x,f.y,f.r,f.rot);
+    else if (f.t === 'comet')  drawComet(f.x,f.y,f.r,f.rot);
+    else if (f.t === 'alien')  drawAlien(f.x,f.y,f.r,f.rot);
+    else if (f.t === 'golden') drawGolden(f.x,f.y,f.r,f.rot);
+    else                       drawBomb(f.x,f.y,f.r,f.rot);
+  }
+}
+
+function draw() {
+  const sx = shake > .5 ? (Math.random()-.5)*shake : 0;
+  const sy = shake > .5 ? (Math.random()-.5)*shake : 0;
+  ctx.setTransform(scale, 0, 0, scale, sx*scale, sy*scale);
+
+  if (S === 'menu') { drawMenu(); return; }
+  if (S === 'over') { drawGameOver(); return; }
+
+  drawBg();
+
+  // Screen flash overlay (drawn after bg, before objects for subtlety)
+  if (flashAlpha > .01) {
+    ctx.fillStyle = flashColor; ctx.globalAlpha = flashAlpha;
+    ctx.fillRect(0,0,W,H); ctx.globalAlpha = 1;
+  }
+
+  drawFallers();
+  drawPlayer();
+
+  for (const p of particles) {
+    ctx.save(); ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.col;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r*p.life, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+  for (const p of popups) {
+    ctx.save(); ctx.globalAlpha = Math.max(0, p.life);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = 'bold 17px Georgia,serif';
+    ctx.fillStyle = p.col; ctx.shadowColor = p.col; ctx.shadowBlur = 7;
+    ctx.fillText(p.txt, p.x, p.y);
+    ctx.restore();
+  }
+
+  if (S === 'choose') { drawChooseScreen(); return; }
+
+  drawHUD();
+}
+
+// ── Loop ──────────────────────────────────────────────────────
+let last = 0;
+function loop(now) {
+  const dt = Math.min((now - last) / 16.67, 3);
+  last = now; frame++;
+  // Juice decay (runs every frame, even while frozen)
+  if (shake > .1)      shake     *= .82;
+  if (flashAlpha > .01) flashAlpha *= .88;
+  // Hit-pause: skip update but still draw
+  if (freezeFrames > 0) { freezeFrames--; }
+  else                   { update(dt); }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// ── Input ─────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (e.key === ' ' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') e.preventDefault();
+  if (S === 'choose') {
+    if (e.key === '1') selectPowerUp(0);
+    if (e.key === '2') selectPowerUp(1);
+    return;
+  }
+  if (e.key === ' ' && S !== 'play') startGame();
+});
+document.addEventListener('keyup', e => { keys[e.key] = false; });
+
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mouseX = (e.clientX - r.left) / scale;
+});
+canvas.addEventListener('mouseleave', () => { mouseX = null; });
+canvas.addEventListener('click', e => {
+  if (S === 'choose') {
+    const r = canvas.getBoundingClientRect();
+    const cx = (e.clientX - r.left) / scale;
+    selectPowerUp(cx < W/2 ? 0 : 1);
+    return;
+  }
+  if (S !== 'play') startGame();
+});
+
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  mouseX = (e.touches[0].clientX - canvas.getBoundingClientRect().left) / scale;
+}, {passive:false});
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (S === 'choose') {
+    const r = canvas.getBoundingClientRect();
+    selectPowerUp(e.touches[0].clientX - r.left < canvas.width/2 ? 0 : 1);
+    return;
+  }
+  if (S !== 'play') startGame();
+}, {passive:false});
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
