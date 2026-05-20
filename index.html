@@ -64,8 +64,9 @@ const SFX = {
   tier:    () => { [523,659,784,988].forEach((f,i) => note(f,.25,'sine',.16,i*.04)); },
   power:   () => { [523,659,784].forEach((f,i) => note(f,.22,'triangle',.15,i*.08)); },
   shield:  () => { note(440,.3,'sine',.12); note(660,.35,'sine',.1,.06); },
-  nearMiss:() => { note(800,.08,'sawtooth',.1); },
-  over:    () => { [392,349,330,294,262,220].forEach((f,i) => note(f,.45,'sine',.18,i*.21)); },
+  nearMiss: () => { note(800,.08,'sawtooth',.1); },
+  invasion: () => { [220,330,440,550].forEach((f,i)=>note(f,.15,'square',.1,i*.1)); note(880,.4,'square',.12,.45); },
+  over:     () => { [392,349,330,294,262,220].forEach((f,i) => note(f,.45,'sine',.18,i*.21)); },
   lvl:     () => { [784,988,1175].forEach((f,i) => note(f,.2,'sine',.14,i*.07)); },
 };
 
@@ -81,6 +82,10 @@ let freezeFrames = 0, shake = 0, flashAlpha = 0, flashColor = '#fff';
 // Power-ups
 let active = [];     // {id, framesLeft, charges?}
 let pwrCards = [];   // 2 PWR entries shown on choose screen
+
+// Invasion event
+let ship = null;           // { x, baseY, y, dir, launchTimer }
+let shipCooldown = 1800;   // frames until first invasion (~30s)
 
 // ── Player ────────────────────────────────────────────────────
 const P_BASE_R = 40;
@@ -309,6 +314,43 @@ function drawGolden(x, y, r, rot) {
   // Happy mouth
   ctx.strokeStyle='#92400e'; ctx.lineWidth=2;
   ctx.beginPath(); ctx.arc(0,r*.32,r*.3,0,Math.PI); ctx.stroke();
+  ctx.restore();
+}
+
+function drawShip(x, y) {
+  ctx.save(); ctx.translate(x, y);
+  // Launch beam (cone beneath hull)
+  const bAlpha = .3 + .2*Math.sin(frame*.18);
+  const beamG = ctx.createLinearGradient(0,6,0,44);
+  beamG.addColorStop(0,`rgba(74,222,128,${bAlpha})`); beamG.addColorStop(1,'rgba(74,222,128,0)');
+  ctx.fillStyle = beamG;
+  ctx.beginPath(); ctx.moveTo(-20,6); ctx.lineTo(20,6); ctx.lineTo(46,44); ctx.lineTo(-46,44); ctx.closePath(); ctx.fill();
+  // Outer glow
+  const og = ctx.createRadialGradient(0,0,0,0,0,58);
+  og.addColorStop(0,'rgba(74,222,128,.18)'); og.addColorStop(1,'rgba(74,222,128,0)');
+  ctx.fillStyle = og; ctx.beginPath(); ctx.ellipse(0,0,58,24,0,0,Math.PI*2); ctx.fill();
+  // Saucer body
+  const bodyG = ctx.createLinearGradient(0,-12,0,14);
+  bodyG.addColorStop(0,'#6b7280'); bodyG.addColorStop(1,'#1f2937');
+  ctx.fillStyle = bodyG; ctx.beginPath(); ctx.ellipse(0,0,46,13,0,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#4ade80'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.ellipse(0,0,46,13,0,0,Math.PI*2); ctx.stroke();
+  // Dome
+  const domeG = ctx.createRadialGradient(-6,-20,2,0,-14,24);
+  domeG.addColorStop(0,'rgba(187,247,208,.75)'); domeG.addColorStop(1,'rgba(74,222,128,.15)');
+  ctx.fillStyle = domeG; ctx.beginPath(); ctx.ellipse(0,-11,22,16,0,Math.PI,Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#86efac'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.ellipse(0,-11,22,16,0,Math.PI,Math.PI*2); ctx.stroke();
+  // Rotating rim lights
+  const LC = ['#ef4444','#fbbf24','#4ade80','#60a5fa','#c084fc','#f472b6'];
+  for (let i=0; i<6; i++) {
+    const a = (i/6)*Math.PI*2 + frame*.065;
+    ctx.fillStyle = LC[i];
+    ctx.globalAlpha = .55 + .45*Math.sin(frame*.1 + i*1.05);
+    ctx.shadowColor = LC[i]; ctx.shadowBlur = 9;
+    ctx.beginPath(); ctx.arc(Math.cos(a)*30, Math.sin(a)*5, 3.8, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha = 1; ctx.shadowBlur = 0;
   ctx.restore();
 }
 
@@ -546,6 +588,38 @@ function update(dt) {
     }
   }
 
+  // Invasion ship
+  if (!ship) {
+    shipCooldown -= dt;
+    if (shipCooldown <= 0) {
+      const dir = Math.random() < .5 ? 1 : -1;
+      ship = { x: dir>0 ? -75 : W+75, baseY: H*.13 + Math.random()*H*.09, y: H*.13, dir, launchTimer: 0 };
+      shipCooldown = 2000 + Math.random()*1500;
+      popup(W/2, H*.4, '👽  INVASION!', '#4ade80');
+      SFX.invasion();
+    }
+  } else {
+    ship.x += ship.dir * 1.35 * dt;
+    ship.y = ship.baseY + Math.sin(frame*.07) * 8;
+    ship.launchTimer -= dt;
+    if (ship.launchTimer <= 0) {
+      ship.launchTimer = 13; // fire every ~13 frames
+      const burst2 = 2 + (Math.random() < .45 ? 1 : 0); // 2 or 3 per burst
+      for (let k=0; k<burst2; k++) {
+        const isGolden = Math.random() < .22;
+        const t = isGolden ? 'golden' : 'alien';
+        const c = OBJ[t];
+        const spd = (c.spd[0] + Math.random()*(c.spd[1]-c.spd[0])) * (1+(level-1)*.05);
+        fallers.push({
+          t, x: ship.x + (Math.random()-.5)*55, y: ship.y+24,
+          vy: spd * .8, vx: (Math.random()-.5)*2.8,
+          r: c.r, rot:0, rs:(Math.random()-.5)*.07, nearMissed:false,
+        });
+      }
+    }
+    if ((ship.dir>0 && ship.x > W+85) || (ship.dir<0 && ship.x < -85)) ship = null;
+  }
+
   // Player movement
   let mv = 0;
   if (keys['ArrowLeft'] || keys['a'] || keys['A']) mv -= 1;
@@ -742,6 +816,7 @@ function startGame() {
   fallers = []; particles = []; popups = []; active = []; pwrCards = [];
   P.x = W/2; P.r = P_BASE_R; P.flash = 0;
   spawnTimer = 0; goldenDelay = 0;
+  ship = null; shipCooldown = 1800;
   freezeFrames = 0; shake = 0; flashAlpha = 0;
   if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
   for (let i=0; i<3; i++) spawnOne();
@@ -749,6 +824,7 @@ function startGame() {
 
 // ── Render ────────────────────────────────────────────────────
 function drawFallers() {
+  if (ship) drawShip(ship.x, ship.y);
   for (const f of fallers) {
     if      (f.t === 'star')   star5(f.x,f.y,f.r,f.rot,OBJ.star.col,OBJ.star.glow);
     else if (f.t === 'moon')   drawMoon(f.x,f.y,f.r,f.rot);
