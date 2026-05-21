@@ -54,6 +54,101 @@ function note(hz, dur, wave = 'sine', vol = 0.18, delay = 0) {
 // Scale pitch up as combo grows — makes catches feel more exciting at high streaks
 function pf(hz) { return hz * (1 + Math.min(combo, 22) * .012); }
 
+// ── Music ─────────────────────────────────────────────────────
+let musicGain = null, musicOn = true;
+let musicNextBeat = 0, musicBeatNum = 0, musicTimer = null;
+
+const BPM = 128, BEAT = 60 / BPM; // ~0.469s per beat
+
+// A minor pentatonic (+ passing tones) across two octaves
+//      A2     G2    F2    E2     A3     C4     D4     E4     G4     A4    C5     E5
+const N=[110, 98.0, 87.3, 82.4, 220.0, 261.6, 293.7, 329.6, 392.0, 440.0,523.3,659.3];
+
+const BASS = [N[0],N[1],N[0],N[2], N[3],N[2],N[1],N[0]]; // walking bass, 8 notes
+
+const ARP = [ // 32 sixteenth notes (2 per beat × 16-beat loop)
+  N[4],N[5], N[6],N[7], N[8],N[9], N[10],N[9], N[8],N[7], N[6],N[5], N[4],N[5], N[6],N[7],
+  N[8],N[9], N[10],N[11],N[10],N[9],N[8],N[7], N[6],N[5], N[4],N[6], N[7],N[8], N[9],N[8],
+];
+
+const PAD = [ // four chord colours, one every 4 beats
+  [N[0],164.8,N[4]],   // Am
+  [N[1],164.8,N[4]],   // Gsus
+  [N[2],130.8,196.0],  // Fmaj
+  [N[3],130.8,196.0],  // Em
+];
+
+function mnote(freq, start, dur, vol, wave='sine') {
+  if (!AC || !musicGain) return;
+  try {
+    const o=AC.createOscillator(), g=AC.createGain();
+    o.connect(g); g.connect(musicGain);
+    o.type=wave; o.frequency.value=freq;
+    g.gain.setValueAtTime(0,start);
+    g.gain.linearRampToValueAtTime(vol,start+0.015);
+    g.gain.exponentialRampToValueAtTime(0.001,start+dur);
+    o.start(start); o.stop(start+dur+0.05);
+  } catch(_){}
+}
+
+function scheduleBeat(b, t) {
+  const inv = !!ship; // more energy during invasions
+  // Bass (every 2 beats)
+  if (b%2===0) mnote(BASS[Math.floor(b/2)%8], t, BEAT*1.75, 0.13, 'triangle');
+  // Arp (2 sixteenth notes per beat)
+  const av = inv ? 0.06 : 0.045;
+  const ai = (b*2)%32;
+  mnote(ARP[ai],        t,          BEAT*0.42, av,    'square');
+  mnote(ARP[(ai+1)%32], t+BEAT*0.5, BEAT*0.42, av,    'square');
+  // Extra octave-up layer during invasion
+  if (inv) {
+    mnote(ARP[ai]*2,        t,          BEAT*0.35, 0.022, 'square');
+    mnote(ARP[(ai+1)%32]*2, t+BEAT*0.5, BEAT*0.35, 0.022, 'square');
+  }
+  // Pad chord (every 4 beats)
+  if (b%4===0) PAD[(b/4)%4].forEach(f=>mnote(f,t,BEAT*3.85,0.02,'sine'));
+  // Kick (strong on 0 & 8, soft on 4 & 12)
+  if (b===0||b===8)  mnote(80,t,0.18,0.18,'triangle');
+  if (b===4||b===12) mnote(80,t,0.11,0.10,'triangle');
+  // Hi-hat every beat; open hat on beat 2 of each bar
+  mnote(4200,t,0.032,0.026,'square');
+  if (b%4===2) mnote(3500,t,0.09,0.032,'square');
+}
+
+function runMusicScheduler() {
+  if (!AC||!musicGain) return;
+  while (musicNextBeat < AC.currentTime+0.3) {
+    scheduleBeat(musicBeatNum, musicNextBeat);
+    musicBeatNum=(musicBeatNum+1)%16;
+    musicNextBeat+=BEAT;
+  }
+  musicTimer=setTimeout(runMusicScheduler,100);
+}
+
+function startMusic() {
+  if (!AC) return;
+  if (!musicGain) { musicGain=AC.createGain(); musicGain.connect(AC.destination); }
+  clearTimeout(musicTimer);
+  musicGain.gain.cancelScheduledValues(AC.currentTime);
+  musicGain.gain.setValueAtTime(0,AC.currentTime);
+  musicGain.gain.linearRampToValueAtTime(musicOn?0.38:0, AC.currentTime+1.8);
+  musicNextBeat=AC.currentTime+0.35; musicBeatNum=0;
+  runMusicScheduler();
+}
+
+function stopMusic() {
+  clearTimeout(musicTimer);
+  if (musicGain) musicGain.gain.setTargetAtTime(0,AC.currentTime,0.7);
+}
+
+function toggleMusic() {
+  musicOn=!musicOn;
+  if (musicGain) {
+    musicGain.gain.cancelScheduledValues(AC.currentTime);
+    musicGain.gain.setTargetAtTime(musicOn?0.38:0, AC.currentTime, 0.25);
+  }
+}
+
 const SFX = {
   star:    () => { note(pf(523),.2); note(pf(659),.2,'sine',.12,.08); },
   moon:    () => { [392,494,587].forEach((f,i) => note(pf(f),.3,'sine',.12,i*.09)); },
@@ -452,9 +547,11 @@ function drawHUD() {
     ctx.font = '13px Georgia,serif'; ctx.fillStyle = '#64748b';
     ctx.fillText(`${combo} streak`, W-16, 16);
   }
-  // Level
+  // Level + mute hint
   ctx.textAlign = 'center'; ctx.font = '11px Georgia,serif'; ctx.fillStyle = '#1e293b';
   ctx.fillText(`LEVEL ${level}`, W/2, H-18);
+  ctx.textAlign = 'right';
+  ctx.fillText(musicOn ? '♪ M' : '× M', W-14, H-18);
   // Active power-up icons
   drawActiveIcons();
   ctx.restore();
@@ -807,6 +904,7 @@ function selectPowerUp(idx) {
 function endGame() {
   S = 'over';
   if (score > hi) { hi = score; localStorage.starfall_hi = hi; }
+  stopMusic();
   SFX.over();
 }
 
@@ -819,6 +917,7 @@ function startGame() {
   ship = null; shipCooldown = 1800;
   freezeFrames = 0; shake = 0; flashAlpha = 0;
   if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+  startMusic();
   for (let i=0; i<3; i++) spawnOne();
 }
 
@@ -893,6 +992,7 @@ function loop(now) {
 document.addEventListener('keydown', e => {
   keys[e.key] = true;
   if (e.key === ' ' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') e.preventDefault();
+  if (e.key === 'm' || e.key === 'M') { toggleMusic(); return; }
   if (S === 'choose') {
     if (e.key === '1') selectPowerUp(0);
     if (e.key === '2') selectPowerUp(1);
