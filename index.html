@@ -55,27 +55,38 @@ function note(hz, dur, wave = 'sine', vol = 0.18, delay = 0) {
 function pf(hz) { return hz * (1 + Math.min(combo, 22) * .012); }
 
 // ── Music ─────────────────────────────────────────────────────
-let musicGain = null, musicOn = true;
+let musicGain = null, musicOn = true, musicMode = 'normal';
 let musicNextBeat = 0, musicBeatNum = 0, musicTimer = null;
-
-const BPM = 128, BEAT = 60 / BPM; // ~0.469s per beat
 
 // A minor pentatonic (+ passing tones) across two octaves
 //      A2     G2    F2    E2     A3     C4     D4     E4     G4     A4    C5     E5
 const N=[110, 98.0, 87.3, 82.4, 220.0, 261.6, 293.7, 329.6, 392.0, 440.0,523.3,659.3];
 
-const BASS = [N[0],N[1],N[0],N[2], N[3],N[2],N[1],N[0]]; // walking bass, 8 notes
-
-const ARP = [ // 32 sixteenth notes (2 per beat × 16-beat loop)
+// ── Normal track  (128 BPM, flowing A minor) ──────────────────
+const BEAT = 60/128;
+const BASS = [N[0],N[1],N[0],N[2], N[3],N[2],N[1],N[0]];
+const ARP  = [
   N[4],N[5], N[6],N[7], N[8],N[9], N[10],N[9], N[8],N[7], N[6],N[5], N[4],N[5], N[6],N[7],
   N[8],N[9], N[10],N[11],N[10],N[9],N[8],N[7], N[6],N[5], N[4],N[6], N[7],N[8], N[9],N[8],
 ];
+const PAD  = [
+  [N[0],164.8,N[4]], [N[1],164.8,N[4]],
+  [N[2],130.8,196.0],[N[3],130.8,196.0],
+];
 
-const PAD = [ // four chord colours, one every 4 beats
-  [N[0],164.8,N[4]],   // Am
-  [N[1],164.8,N[4]],   // Gsus
-  [N[2],130.8,196.0],  // Fmaj
-  [N[3],130.8,196.0],  // Em
+// ── Invasion track  (165 BPM, driving power-bass attack) ──────
+const IBEAT = 60/165;
+// Bass: A2-E2 power alternation every beat — heavy anchor
+const IBASS = [
+  N[0],N[3], N[0],N[3], N[1],N[3], N[2],N[3],
+  N[0],N[3], N[0],N[3], N[2],N[3], N[1],N[3],
+];
+// Arp: angular leaps up to E5 — urgent & alien
+const IARP = [
+  N[4],N[9],  N[9],N[4],  N[4],N[9],  N[8],N[9],
+  N[4],N[10], N[10],N[4], N[7],N[9],  N[8],N[10],
+  N[4],N[11], N[9],N[8],  N[7],N[9],  N[4],N[9],
+  N[8],N[7],  N[6],N[7],  N[8],N[9],  N[4],N[9],
 ];
 
 function mnote(freq, start, dur, vol, wave='sine') {
@@ -91,38 +102,57 @@ function mnote(freq, start, dur, vol, wave='sine') {
   } catch(_){}
 }
 
-function scheduleBeat(b, t) {
-  const inv = !!ship; // more energy during invasions
-  // Bass (every 2 beats)
+function scheduleNormalBeat(b, t) {
   if (b%2===0) mnote(BASS[Math.floor(b/2)%8], t, BEAT*1.75, 0.13, 'triangle');
-  // Arp (2 sixteenth notes per beat)
-  const av = inv ? 0.06 : 0.045;
-  const ai = (b*2)%32;
-  mnote(ARP[ai],        t,          BEAT*0.42, av,    'square');
-  mnote(ARP[(ai+1)%32], t+BEAT*0.5, BEAT*0.42, av,    'square');
-  // Extra octave-up layer during invasion
-  if (inv) {
-    mnote(ARP[ai]*2,        t,          BEAT*0.35, 0.022, 'square');
-    mnote(ARP[(ai+1)%32]*2, t+BEAT*0.5, BEAT*0.35, 0.022, 'square');
-  }
-  // Pad chord (every 4 beats)
+  const ai=(b*2)%32;
+  mnote(ARP[ai],        t,          BEAT*0.42, 0.045, 'square');
+  mnote(ARP[(ai+1)%32], t+BEAT*0.5, BEAT*0.42, 0.045, 'square');
   if (b%4===0) PAD[(b/4)%4].forEach(f=>mnote(f,t,BEAT*3.85,0.02,'sine'));
-  // Kick (strong on 0 & 8, soft on 4 & 12)
   if (b===0||b===8)  mnote(80,t,0.18,0.18,'triangle');
   if (b===4||b===12) mnote(80,t,0.11,0.10,'triangle');
-  // Hi-hat every beat; open hat on beat 2 of each bar
   mnote(4200,t,0.032,0.026,'square');
   if (b%4===2) mnote(3500,t,0.09,0.032,'square');
 }
 
+function scheduleInvasionBeat(b, t) {
+  // Bass every beat — relentless
+  mnote(IBASS[b%16], t, IBEAT*0.82, 0.15, 'triangle');
+  // Arp: two sixteenth notes per beat, louder & angrier
+  const ai=(b*2)%32;
+  mnote(IARP[ai],        t,           IBEAT*0.38, 0.07, 'square');
+  mnote(IARP[(ai+1)%32], t+IBEAT*0.5, IBEAT*0.38, 0.07, 'square');
+  // Kick every beat; extra heavy on 0 & 8
+  mnote(80,t,0.13,0.16,'triangle');
+  if (b===0||b===8) mnote(58,t,0.18,0.14,'triangle');
+  // Double hi-hat (2 per beat = frantic)
+  mnote(5000,t,          0.024,0.032,'square');
+  mnote(5000,t+IBEAT*0.5,0.024,0.032,'square');
+  // Snare crack on beat 2 of each bar
+  if (b%4===2) { mnote(2500,t,0.06,0.055,'square'); mnote(1800,t,0.07,0.04,'square'); }
+}
+
 function runMusicScheduler() {
   if (!AC||!musicGain) return;
+  const bd = musicMode==='invasion' ? IBEAT : BEAT;
   while (musicNextBeat < AC.currentTime+0.3) {
-    scheduleBeat(musicBeatNum, musicNextBeat);
+    if (musicMode==='invasion') scheduleInvasionBeat(musicBeatNum, musicNextBeat);
+    else                        scheduleNormalBeat(musicBeatNum,   musicNextBeat);
     musicBeatNum=(musicBeatNum+1)%16;
-    musicNextBeat+=BEAT;
+    musicNextBeat+=bd;
   }
   musicTimer=setTimeout(runMusicScheduler,100);
+}
+
+function setMusicMode(mode) {
+  if (musicMode===mode || !AC || !musicGain) return;
+  musicMode=mode;
+  clearTimeout(musicTimer);
+  // Quick dip then restart — sounds like a intentional track switch
+  musicGain.gain.cancelScheduledValues(AC.currentTime);
+  musicGain.gain.setTargetAtTime(0.04, AC.currentTime, 0.04);
+  musicGain.gain.setTargetAtTime(musicOn?0.38:0, AC.currentTime+0.2, 0.08);
+  musicNextBeat=AC.currentTime+0.25; musicBeatNum=0;
+  runMusicScheduler();
 }
 
 function startMusic() {
@@ -145,7 +175,7 @@ function toggleMusic() {
   musicOn=!musicOn;
   if (musicGain) {
     musicGain.gain.cancelScheduledValues(AC.currentTime);
-    musicGain.gain.setTargetAtTime(musicOn?0.38:0, AC.currentTime, 0.25);
+    musicGain.gain.setTargetAtTime(musicOn?0.38:0, AC.currentTime,0.25);
   }
 }
 
@@ -694,6 +724,7 @@ function update(dt) {
       shipCooldown = 2000 + Math.random()*1500;
       popup(W/2, H*.4, '👽  INVASION!', '#4ade80');
       SFX.invasion();
+      setMusicMode('invasion');
     }
   } else {
     ship.x += ship.dir * 1.35 * dt;
@@ -714,7 +745,7 @@ function update(dt) {
         });
       }
     }
-    if ((ship.dir>0 && ship.x > W+85) || (ship.dir<0 && ship.x < -85)) ship = null;
+    if ((ship.dir>0 && ship.x > W+85) || (ship.dir<0 && ship.x < -85)) { ship = null; setMusicMode('normal'); }
   }
 
   // Player movement
@@ -916,6 +947,7 @@ function startGame() {
   spawnTimer = 0; goldenDelay = 0;
   ship = null; shipCooldown = 1800;
   freezeFrames = 0; shake = 0; flashAlpha = 0;
+  musicMode = 'normal';
   if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
   startMusic();
   for (let i=0; i<3; i++) spawnOne();
